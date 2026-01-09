@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "math-rl-wrapper"
+version = "0.1.0"
+description = "Math RL training wrapper for tinker-cookbook with prompt template support"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    # tinker-cookbook must be installed separately:
+    # pip install -e ../tinker-cookbook[dev]
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "ruff",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+[tool.ruff]
+line-length = 100
