@@ -12,7 +12,7 @@ from tinker_cookbook.recipes.math_rl.math_grading import (
     grade_answer_math_verify,
     run_with_timeout_signal,
 )
-from tinker_cookbook.rl.problem_env import ProblemEnv, ProblemGroupBuilder, logger
+from tinker_cookbook.rl.problem_env import ProblemEnv, ProblemGroupBuilder, PromptStrategy, logger
 from tinker_cookbook.rl.types import EnvGroupBuilder, RLDataset, RLDatasetBuilder
 from tinker_cookbook.tokenizer_utils import get_tokenizer
 
@@ -26,8 +26,9 @@ class MathEnv(ProblemEnv):
         convo_prefix: list[renderers.Message] | None = None,
         grader: Literal["sympy", "math_verify"] = "sympy",
         timeout: float = 1.0,
+        strategy: PromptStrategy | None = None,
     ):
-        super().__init__(renderer, convo_prefix)
+        super().__init__(renderer, convo_prefix, strategy=strategy)
         self.problem = problem
         self.answer = answer
         self.grader = grader
@@ -147,6 +148,7 @@ class MathDataset(RLDataset):
         convo_prefix: list[renderers.Message] | None = None,
         split: Literal["train", "test"] = "train",
         seed: int = 0,
+        strategy: PromptStrategy | None = None,
     ):
         if split == "train":
             self.ds = _get_hendrycks_math_train().shuffle(seed=seed)
@@ -156,6 +158,7 @@ class MathDataset(RLDataset):
         self.group_size = group_size if split == "train" else 1
         self.renderer = renderer
         self.convo_prefix = convo_prefix
+        self.strategy = strategy
 
     def get_batch(self, index: int) -> Sequence[EnvGroupBuilder]:
         batch_start = index * self.batch_size
@@ -180,7 +183,12 @@ class MathDataset(RLDataset):
             return None
         return ProblemGroupBuilder(
             env_thunk=partial(
-                MathEnv, x["problem"], answer, self.renderer, convo_prefix=self.convo_prefix
+                MathEnv,
+                x["problem"],
+                answer,
+                self.renderer,
+                convo_prefix=self.convo_prefix,
+                strategy=self.strategy,
             ),
             num_envs=group_size,
         )
@@ -194,12 +202,21 @@ class MathDatasetBuilder(RLDatasetBuilder):
     group_size: int
     convo_prefix: list[renderers.Message] | None | Literal["standard"] = "standard"
     seed: int = 0
+    # Strategy takes precedence over convo_prefix when provided
+    strategy: PromptStrategy | None = None
 
     async def __call__(self) -> tuple[MathDataset, MathDataset]:
-        if self.convo_prefix == "standard":
+        # Strategy takes precedence over convo_prefix
+        if self.strategy is not None:
+            convo_prefix = None  # Strategy handles message building
+            strategy = self.strategy
+        elif self.convo_prefix == "standard":
             convo_prefix = MathEnv.standard_fewshot_prefix()
+            strategy = None
         else:
             convo_prefix = self.convo_prefix
+            strategy = None
+
         tokenizer = get_tokenizer(self.model_name_for_tokenizer)
         renderer = renderers.get_renderer(self.renderer_name, tokenizer=tokenizer)
         datasets = [
@@ -210,6 +227,7 @@ class MathDatasetBuilder(RLDatasetBuilder):
                 convo_prefix=convo_prefix,
                 split=split,
                 seed=self.seed,
+                strategy=strategy,
             )
             for split in ("train", "test")
         ]
@@ -224,6 +242,7 @@ class PolarisDataset(MathDataset):
         renderer: renderers.Renderer,
         convo_prefix: list[renderers.Message] | None = None,
         seed: int = 0,
+        strategy: PromptStrategy | None = None,
     ):
         # Don't call super().__init__ since we're overriding the dataset loading
         self.ds = load_dataset("POLARIS-Project/Polaris-Dataset-53K", split="train").shuffle(
@@ -233,6 +252,7 @@ class PolarisDataset(MathDataset):
         self.group_size = group_size
         self.renderer = renderer
         self.convo_prefix = convo_prefix
+        self.strategy = strategy
 
     def _make_env_group_builder(
         self, x: dict[str, str], group_size: int
@@ -244,7 +264,12 @@ class PolarisDataset(MathDataset):
             return None
         return ProblemGroupBuilder(
             env_thunk=partial(
-                MathEnv, problem, answer, self.renderer, convo_prefix=self.convo_prefix
+                MathEnv,
+                problem,
+                answer,
+                self.renderer,
+                convo_prefix=self.convo_prefix,
+                strategy=self.strategy,
             ),
             num_envs=group_size,
             dataset_name="polaris",
@@ -258,6 +283,7 @@ class PolarisDatasetBuilder(RLDatasetBuilder):
     renderer_name: str
     group_size: int
     seed: int = 0
+    strategy: PromptStrategy | None = None
 
     async def __call__(self) -> tuple[PolarisDataset, None]:
         tokenizer = get_tokenizer(self.model_name_for_tokenizer)
@@ -266,6 +292,7 @@ class PolarisDatasetBuilder(RLDatasetBuilder):
             group_size=self.group_size,
             renderer=renderers.get_renderer(self.renderer_name, tokenizer=tokenizer),
             seed=self.seed,
+            strategy=self.strategy,
         ), None
 
 
@@ -277,6 +304,7 @@ class DeepMathDataset(MathDataset):
         renderer: renderers.Renderer,
         convo_prefix: list[renderers.Message] | None = None,
         seed: int = 0,
+        strategy: PromptStrategy | None = None,
     ):
         # Don't call super().__init__ since we're overriding the dataset loading
         self.ds = load_dataset("zwhe99/DeepMath-103K", split="train").shuffle(seed=seed)
@@ -284,6 +312,7 @@ class DeepMathDataset(MathDataset):
         self.group_size = group_size
         self.renderer = renderer
         self.convo_prefix = convo_prefix
+        self.strategy = strategy
 
     def _make_env_group_builder(
         self, x: dict[str, str], group_size: int
@@ -295,7 +324,12 @@ class DeepMathDataset(MathDataset):
             return None
         return ProblemGroupBuilder(
             env_thunk=partial(
-                MathEnv, problem, answer, self.renderer, convo_prefix=self.convo_prefix
+                MathEnv,
+                problem,
+                answer,
+                self.renderer,
+                convo_prefix=self.convo_prefix,
+                strategy=self.strategy,
             ),
             num_envs=group_size,
             dataset_name="deepmath",
@@ -309,6 +343,7 @@ class DeepMathDatasetBuilder(RLDatasetBuilder):
     renderer_name: str
     group_size: int
     seed: int = 0
+    strategy: PromptStrategy | None = None
 
     async def __call__(self) -> tuple[DeepMathDataset, None]:
         tokenizer = get_tokenizer(self.model_name_for_tokenizer)
@@ -317,6 +352,7 @@ class DeepMathDatasetBuilder(RLDatasetBuilder):
             group_size=self.group_size,
             renderer=renderers.get_renderer(self.renderer_name, tokenizer=tokenizer),
             seed=self.seed,
+            strategy=self.strategy,
         ), None
 
 
@@ -329,6 +365,7 @@ class Gsm8kDataset(RLDataset):
         convo_prefix: list[renderers.Message] | None = None,
         split: Literal["train", "test"] = "train",
         seed: int = 0,
+        strategy: PromptStrategy | None = None,
     ):
         if split not in ("train", "test"):
             raise ValueError("split must be 'train' or 'test'")
@@ -339,6 +376,7 @@ class Gsm8kDataset(RLDataset):
         self.group_size = group_size if split == "train" else 1
         self.renderer = renderer
         self.convo_prefix = convo_prefix
+        self.strategy = strategy
 
     @classmethod
     def question_suffix(cls) -> str:
@@ -368,7 +406,12 @@ class Gsm8kDataset(RLDataset):
             return None
         return ProblemGroupBuilder(
             env_thunk=partial(
-                MathEnv, problem, answer, self.renderer, convo_prefix=self.convo_prefix
+                MathEnv,
+                problem,
+                answer,
+                self.renderer,
+                convo_prefix=self.convo_prefix,
+                strategy=self.strategy,
             ),
             num_envs=group_size,
         )
@@ -382,12 +425,21 @@ class Gsm8kDatasetBuilder(RLDatasetBuilder):
     group_size: int
     convo_prefix: list[renderers.Message] | None | Literal["standard"] = "standard"
     seed: int = 0
+    # Strategy takes precedence over convo_prefix when provided
+    strategy: PromptStrategy | None = None
 
     async def __call__(self) -> tuple[Gsm8kDataset, Gsm8kDataset]:
-        if self.convo_prefix == "standard":
+        # Strategy takes precedence over convo_prefix
+        if self.strategy is not None:
+            convo_prefix = None  # Strategy handles message building
+            strategy = self.strategy
+        elif self.convo_prefix == "standard":
             convo_prefix = MathEnv.standard_fewshot_prefix()
+            strategy = None
         else:
             convo_prefix = self.convo_prefix
+            strategy = None
+
         tokenizer = get_tokenizer(self.model_name_for_tokenizer)
         renderer = renderers.get_renderer(self.renderer_name, tokenizer=tokenizer)
         datasets = [
@@ -398,6 +450,7 @@ class Gsm8kDatasetBuilder(RLDatasetBuilder):
                 convo_prefix=convo_prefix,
                 split=split,
                 seed=self.seed,
+                strategy=strategy,
             )
             for split in ("train", "test")
         ]

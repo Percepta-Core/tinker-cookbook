@@ -4,7 +4,7 @@ from typing import Sequence
 import chz
 import numpy as np
 from tinker_cookbook import renderers
-from tinker_cookbook.rl.problem_env import ProblemEnv, ProblemGroupBuilder
+from tinker_cookbook.rl.problem_env import ProblemEnv, ProblemGroupBuilder, PromptStrategy
 from tinker_cookbook.rl.types import EnvGroupBuilder, RLDataset, RLDatasetBuilder
 from tinker_cookbook.tokenizer_utils import get_tokenizer
 
@@ -20,8 +20,9 @@ class ArithmeticEnv(ProblemEnv):
         y: int,
         renderer: renderers.Renderer,
         convo_prefix: list[renderers.Message] | None = None,
+        strategy: PromptStrategy | None = None,
     ):
-        super().__init__(renderer, convo_prefix)
+        super().__init__(renderer, convo_prefix, strategy=strategy)
         self.x = x
         self.y = y
 
@@ -58,6 +59,7 @@ class ArithmeticDataset(RLDataset):
         group_size: int,
         n_batches: int = 100,
         include_fewshot: bool = True,
+        strategy: PromptStrategy | None = None,
     ):
         self._rng = np.random.RandomState(None)
         self.batch_size = batch_size
@@ -65,6 +67,7 @@ class ArithmeticDataset(RLDataset):
         self.renderer = renderer
         self.n_batches = n_batches
         self.include_fewshot = include_fewshot
+        self.strategy = strategy
 
     def get_batch(self, index: int) -> Sequence[EnvGroupBuilder]:
         self._rng.seed(index)
@@ -73,10 +76,21 @@ class ArithmeticDataset(RLDataset):
     def _make_env_group_builder(self, rng: np.random.RandomState) -> ProblemGroupBuilder:
         x = rng.randint(0, 101)
         y = rng.randint(0, 101)
-        convo_prefix = ArithmeticEnv.standard_fewshot_prefix() if self.include_fewshot else None
+        # Strategy takes precedence over include_fewshot
+        if self.strategy is not None:
+            convo_prefix = None
+            strategy = self.strategy
+        else:
+            convo_prefix = ArithmeticEnv.standard_fewshot_prefix() if self.include_fewshot else None
+            strategy = None
         return ProblemGroupBuilder(
             env_thunk=partial(
-                ArithmeticEnv, x, y, convo_prefix=convo_prefix, renderer=self.renderer
+                ArithmeticEnv,
+                x,
+                y,
+                convo_prefix=convo_prefix,
+                renderer=self.renderer,
+                strategy=strategy,
             ),
             num_envs=self.group_size,
         )
@@ -93,6 +107,8 @@ class ArithmeticDatasetBuilder(RLDatasetBuilder):
     n_batches: int
     group_size: int
     include_fewshot: bool = True
+    # Strategy takes precedence over include_fewshot when provided
+    strategy: PromptStrategy | None = None
 
     async def __call__(self) -> tuple[ArithmeticDataset, None]:
         tokenizer = get_tokenizer(self.model_name_for_tokenizer)
@@ -102,4 +118,5 @@ class ArithmeticDatasetBuilder(RLDatasetBuilder):
             n_batches=self.n_batches,
             include_fewshot=self.include_fewshot,
             group_size=self.group_size,
+            strategy=self.strategy,
         ), None

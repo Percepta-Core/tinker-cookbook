@@ -1,8 +1,8 @@
 """
-Main entry point for math RL training with prompt template support.
+Main entry point for math RL training with prompt template/strategy support.
 
 This module extends the tinker-cookbook math RL recipe with:
-- Customizable prompt templates (via convo_prefix)
+- Customizable prompt strategies (first-class `s` object for (s, θ) optimization)
 - Organized output directory structure
 - Sensible defaults for common use cases
 
@@ -23,10 +23,12 @@ from tinker_cookbook.recipes.math_rl.math_env import (
     MathDatasetBuilder,
     MathEnv,
 )
+from tinker_cookbook.rl.problem_env import PromptStrategy
 from tinker_cookbook.rl.train import AsyncConfig, Config, main
 from tinker_cookbook.rl.types import RLDatasetBuilder
 
-from .prompt_templates import get_template
+from .prompt_strategy import FewShotStrategy, NoPromptStrategy
+from .prompt_templates import get_strategy_by_name, get_template
 
 
 @chz.chz
@@ -84,8 +86,12 @@ def get_dataset_builder(
     seed: int,
     prompt_template: str,
     n_batches: int | None = None,
+    strategy: PromptStrategy | None = None,
 ) -> RLDatasetBuilder:
-    """Create dataset builder with custom prompt template.
+    """Create dataset builder with custom prompt template or strategy.
+
+    The `strategy` parameter takes precedence over `prompt_template` when provided.
+    This enables the (s, θ) joint optimization where `s` is the prompt strategy.
 
     Args:
         env: Environment name ("gsm8k", "math", or "arithmetic")
@@ -95,19 +101,27 @@ def get_dataset_builder(
         group_size: Number of rollouts per problem
         seed: Random seed for data shuffling
         prompt_template: Template name or "none" for no few-shot examples
+        n_batches: Number of batches (for arithmetic env)
+        strategy: First-class PromptStrategy object (takes precedence over prompt_template)
 
     Returns:
         Configured RLDatasetBuilder
     """
-    # Determine convo_prefix based on template choice
-    if prompt_template == "none":
-        convo_prefix = None
+    # Strategy takes precedence over prompt_template
+    if strategy is not None:
+        # Use the provided strategy directly
+        pass
+    elif prompt_template == "none":
+        strategy = NoPromptStrategy(strategy_name="none")
     elif prompt_template == "standard":
-        # Use the default from MathEnv
-        convo_prefix = MathEnv.standard_fewshot_prefix()
+        # Use the default from MathEnv as a FewShotStrategy
+        strategy = FewShotStrategy(
+            fewshot_messages=MathEnv.standard_fewshot_prefix(),
+            strategy_name="standard",
+        )
     else:
-        # Use custom template
-        convo_prefix = get_template(prompt_template)
+        # Use custom template as strategy
+        strategy = get_strategy_by_name(prompt_template)
 
     if env == "arithmetic":
         return ArithmeticDatasetBuilder(
@@ -116,7 +130,8 @@ def get_dataset_builder(
             renderer_name=renderer_name,
             group_size=group_size,
             n_batches=n_batches or 100,
-            include_fewshot=(prompt_template != "none"),
+            include_fewshot=False,  # Strategy handles this
+            strategy=strategy,
         )
     elif env == "gsm8k":
         return Gsm8kDatasetBuilder(
@@ -124,8 +139,9 @@ def get_dataset_builder(
             model_name_for_tokenizer=model_name,
             renderer_name=renderer_name,
             group_size=group_size,
-            convo_prefix=convo_prefix,
+            convo_prefix=None,  # Strategy handles this
             seed=seed,
+            strategy=strategy,
         )
     elif env == "math":
         return MathDatasetBuilder(
@@ -133,8 +149,9 @@ def get_dataset_builder(
             model_name_for_tokenizer=model_name,
             renderer_name=renderer_name,
             group_size=group_size,
-            convo_prefix=convo_prefix,
+            convo_prefix=None,  # Strategy handles this
             seed=seed,
+            strategy=strategy,
         )
     else:
         raise ValueError(f"Unknown environment: {env}. Supported: arithmetic, gsm8k, math")

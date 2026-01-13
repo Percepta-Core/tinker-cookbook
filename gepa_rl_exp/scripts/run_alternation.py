@@ -1,12 +1,13 @@
 """
-GEPA+RL Alternation: Block coordinate ascent on (prompt, weights).
+GEPA+RL Alternation: Block coordinate ascent on (s, θ).
 
 Implements the simple alternation loop:
-  1. GEPA phase: Evaluate templates on current θ, pick winner
-  2. RL phase: Train with winner template for N batches, save checkpoint
+  1. GEPA phase: Evaluate strategies on current θ, pick winner s*
+  2. RL phase: Train with s* for N batches, update θ
   3. Repeat
 
-This is the "one-shot GEPA → RL → GEPA → repeat" pattern described in the design.
+This is the "one-shot GEPA → RL → GEPA → repeat" pattern for joint
+optimization over prompt strategy `s` and model weights `θ`.
 
 Usage:
     cd gepa_rl_exp
@@ -28,18 +29,20 @@ import tinker
 from tinker_cookbook import checkpoint_utils, model_info
 from tinker_cookbook.completers import TinkerTokenCompleter
 from tinker_cookbook.rl.metric_util import dataset_to_env_group_builders
+from tinker_cookbook.rl.problem_env import PromptStrategy
 from tinker_cookbook.rl.rollouts import do_group_rollout
 from tinker_cookbook.rl.train import AsyncConfig, Config, main as rl_main
 
 # Add parent to path for src imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from src.prompt_templates import get_template
+from src.prompt_strategy import get_strategy, list_strategies
+from src.prompt_templates import get_strategy_by_name, get_template
 from src.train import get_dataset_builder
 
 
 @chz.chz
 class AlternationConfig:
-    """Configuration for GEPA+RL alternation loop."""
+    """Configuration for GEPA+RL alternation loop on (s, θ)."""
 
     # Model configuration
     model_name: str = "Qwen/Qwen3-8B"
@@ -54,10 +57,12 @@ class AlternationConfig:
     n_rounds: int = 3  # Number of GEPA→RL cycles
     rl_batches_per_round: int = 10  # RL training batches per round (U steps)
 
-    # GEPA settings
-    gepa_num_problems: int = 32  # Problems to evaluate per template
+    # GEPA settings - strategy pool for `s` optimization
+    gepa_num_problems: int = 32  # Problems to evaluate per strategy
     gepa_group_size: int = 4  # Rollouts per problem for GEPA
-    templates: str = "baseline,step_by_step,concise"  # Comma-separated template pool
+    strategies: str = "baseline,step_by_step,concise"  # Comma-separated strategy pool
+    # Legacy alias for backward compatibility
+    templates: str | None = None  # Deprecated: use strategies
 
     # RL settings (passed through to RL training)
     rl_group_size: int = 4
@@ -87,33 +92,41 @@ class RoundResult:
     """Results from one GEPA→RL round."""
 
     round_idx: int
-    gepa_results: dict[str, float]  # template -> mean_reward
-    selected_template: str
+    gepa_results: dict[str, float]  # strategy_name -> mean_reward
+    selected_strategy: str  # Name of the winning strategy `s*`
     rl_final_correct_rate: float | None
     checkpoint_paths: CheckpointPaths | None
+
+    # Legacy alias for backward compatibility
+    @property
+    def selected_template(self) -> str:
+        return self.selected_strategy
 
 
 async def run_gepa_phase(
     config: AlternationConfig,
     sampler_path: str | None,
     renderer_name: str,
-    templates: list[str],
-) -> tuple[str, dict[str, float]]:
+    strategy_names: list[str],
+) -> tuple[PromptStrategy, dict[str, float]]:
     """
-    Run GEPA evaluation: evaluate all templates on current checkpoint.
+    Run GEPA evaluation: evaluate all strategies on current θ.
+
+    This is the `s` optimization step in (s, θ) block coordinate ascent.
 
     Args:
         sampler_path: Path to sampler weights (for inference only)
+        strategy_names: List of strategy names to evaluate
 
     Returns:
-        (winning_template, results_dict)
+        (winning_strategy, results_dict) where results_dict maps strategy_name -> mean_reward
     """
     print("\n" + "=" * 60)
-    print("GEPA PHASE: Evaluating templates")
+    print("GEPA PHASE: Evaluating strategies (optimizing s)")
     print("=" * 60)
-    print(f"  Checkpoint: {sampler_path or 'base model (θ_0)'}")
-    print(f"  Templates: {templates}")
-    print(f"  Problems per template: {config.gepa_num_problems}")
+    print(f"  Current θ: {sampler_path or 'base model (θ_0)'}")
+    print(f"  Strategies: {strategy_names}")
+    print(f"  Problems per strategy: {config.gepa_num_problems}")
 
     # Create service client
     service = tinker.ServiceClient()
@@ -128,11 +141,16 @@ async def run_gepa_phase(
         sampling_client = service.create_sampling_client(base_model=config.model_name)
 
     results: dict[str, float] = {}
+    strategies: dict[str, PromptStrategy] = {}
 
-    for template in templates:
-        print(f"\n  Evaluating: {template}")
+    for strategy_name in strategy_names:
+        print(f"\n  Evaluating strategy: {strategy_name}")
 
-        # Create dataset builder for this template
+        # Get the strategy object
+        strategy = get_strategy_by_name(strategy_name)
+        strategies[strategy_name] = strategy
+
+        # Create dataset builder with this strategy
         dataset_builder = get_dataset_builder(
             env=config.env,
             batch_size=1,
@@ -140,8 +158,9 @@ async def run_gepa_phase(
             renderer_name=renderer_name,
             group_size=config.gepa_group_size,
             seed=config.seed,
-            prompt_template=template,
+            prompt_template=strategy_name,  # For backward compat
             n_batches=config.gepa_num_problems,
+            strategy=strategy,
         )
 
         # Build dataset
@@ -171,41 +190,45 @@ async def run_gepa_phase(
                 all_rewards.append(episode_reward)
 
         mean_reward = sum(all_rewards) / len(all_rewards) if all_rewards else 0.0
-        results[template] = mean_reward
+        results[strategy_name] = mean_reward
         print(f"    Mean reward: {mean_reward:.3f}")
 
-    # Select winner
-    winner = max(results, key=lambda t: results[t])
-    print(f"\n  WINNER: {winner} (reward={results[winner]:.3f})")
+    # Select winner (s*)
+    winner_name = max(results, key=lambda s: results[s])
+    winner = strategies[winner_name]
+    print(f"\n  WINNER: s* = {winner_name} (reward={results[winner_name]:.3f})")
 
     return winner, results
 
 
 async def run_rl_phase(
     config: AlternationConfig,
-    template: str,
+    strategy: PromptStrategy,
     round_idx: int,
     state_path: str | None,
     renderer_name: str,
     round_log_path: str,
 ) -> CheckpointPaths | None:
     """
-    Run RL training phase with selected template.
+    Run RL training phase with selected strategy.
+
+    This is the `θ` optimization step in (s, θ) block coordinate ascent.
 
     Args:
+        strategy: The selected prompt strategy s* from GEPA phase
         state_path: Path to full training state (weights + optimizer) for continuation
 
     Returns:
         CheckpointPaths with both state_path and sampler_path, or None if training failed
     """
     print("\n" + "=" * 60)
-    print(f"RL PHASE: Training with template '{template}'")
+    print(f"RL PHASE: Training θ with strategy s* = '{strategy.name}'")
     print("=" * 60)
     print(f"  Batches: {config.rl_batches_per_round}")
-    print(f"  Starting from: {state_path or 'base model'}")
+    print(f"  Starting θ from: {state_path or 'base model'}")
     print(f"  Log path: {round_log_path}")
 
-    # Build RL config
+    # Build RL config with the strategy
     rl_config = Config(
         learning_rate=config.learning_rate,
         dataset_builder=get_dataset_builder(
@@ -215,15 +238,16 @@ async def run_rl_phase(
             renderer_name=renderer_name,
             group_size=config.rl_group_size,
             seed=config.seed + round_idx,  # Vary seed per round
-            prompt_template=template,
+            prompt_template=strategy.name,  # For logging/backward compat
             n_batches=config.rl_batches_per_round,
+            strategy=strategy,  # First-class strategy object
         ),
         model_name=config.model_name,
         lora_rank=config.lora_rank,
         max_tokens=config.max_tokens,
         temperature=config.temperature,
         wandb_project=config.wandb_project,
-        wandb_name=f"round{round_idx}-{template}" if config.wandb_project else None,
+        wandb_name=f"round{round_idx}-{strategy.name}" if config.wandb_project else None,
         log_path=round_log_path,
         base_url=config.base_url,
         load_checkpoint_path=state_path,
@@ -247,22 +271,26 @@ async def run_rl_phase(
 
 
 async def run_alternation(config: AlternationConfig) -> list[RoundResult]:
-    """Run the full GEPA+RL alternation loop."""
+    """Run the full GEPA+RL alternation loop on (s, θ)."""
 
     print("=" * 70)
-    print("GEPA+RL ALTERNATION")
+    print("GEPA+RL ALTERNATION: Block coordinate ascent on (s, θ)")
     print("=" * 70)
-    print(f"Model: {config.model_name}")
+    print(f"Model (θ base): {config.model_name}")
     print(f"Environment: {config.env}")
     print(f"Rounds: {config.n_rounds}")
-    print(f"RL batches per round: {config.rl_batches_per_round}")
+    print(f"RL batches per round (θ steps): {config.rl_batches_per_round}")
     print("=" * 70)
 
     # Setup
     renderer_name = config.renderer_name or model_info.get_recommended_renderer_name(
         config.model_name
     )
-    templates = [t.strip() for t in config.templates.split(",")]
+
+    # Parse strategy pool - support both 'strategies' and legacy 'templates'
+    strategy_str = config.templates if config.templates else config.strategies
+    strategy_names = [s.strip() for s in strategy_str.split(",")]
+    print(f"Strategy pool: {strategy_names}")
 
     # Determine base log path
     if config.log_path:
@@ -275,7 +303,7 @@ async def run_alternation(config: AlternationConfig) -> list[RoundResult]:
     base_log_path = os.path.expanduser(base_log_path)
     os.makedirs(base_log_path, exist_ok=True)
 
-    # State: track both state_path (for RL) and sampler_path (for GEPA)
+    # State: track both θ paths and current s
     current_paths: CheckpointPaths | None = None
     results: list[RoundResult] = []
 
@@ -284,23 +312,23 @@ async def run_alternation(config: AlternationConfig) -> list[RoundResult]:
         print(f"# ROUND {round_idx + 1} / {config.n_rounds}")
         print(f"{'#' * 70}")
 
-        # 1. GEPA phase: evaluate templates, pick winner
+        # 1. GEPA phase: optimize s with θ fixed
         # Use sampler_path for inference
         sampler_path = current_paths.sampler_path if current_paths else None
-        selected_template, gepa_results = await run_gepa_phase(
+        selected_strategy, gepa_results = await run_gepa_phase(
             config=config,
             sampler_path=sampler_path,
             renderer_name=renderer_name,
-            templates=templates,
+            strategy_names=strategy_names,
         )
 
-        # 2. RL phase: train with selected template
+        # 2. RL phase: optimize θ with s fixed
         # Use state_path for training continuation
         state_path = current_paths.state_path if current_paths else None
         round_log_path = os.path.join(base_log_path, f"round{round_idx}")
         new_paths = await run_rl_phase(
             config=config,
-            template=selected_template,
+            strategy=selected_strategy,
             round_idx=round_idx,
             state_path=state_path,
             renderer_name=renderer_name,
@@ -311,7 +339,7 @@ async def run_alternation(config: AlternationConfig) -> list[RoundResult]:
         result = RoundResult(
             round_idx=round_idx,
             gepa_results=gepa_results,
-            selected_template=selected_template,
+            selected_strategy=selected_strategy.name,
             rl_final_correct_rate=None,  # Could parse from metrics.jsonl
             checkpoint_paths=new_paths,
         )
@@ -320,7 +348,7 @@ async def run_alternation(config: AlternationConfig) -> list[RoundResult]:
         # Update state for next round
         current_paths = new_paths
 
-        # Save round summary
+        # Save round summary with both s and θ state
         summary_path = os.path.join(base_log_path, "alternation_log.jsonl")
         with open(summary_path, "a") as f:
             f.write(
@@ -328,7 +356,9 @@ async def run_alternation(config: AlternationConfig) -> list[RoundResult]:
                     {
                         "round": round_idx,
                         "gepa_results": gepa_results,
-                        "selected_template": selected_template,
+                        "selected_strategy": selected_strategy.name,
+                        # Legacy field for backward compatibility
+                        "selected_template": selected_strategy.name,
                         "state_path": new_paths.state_path if new_paths else None,
                         "sampler_path": new_paths.sampler_path if new_paths else None,
                     }
@@ -347,17 +377,17 @@ def print_summary(results: list[RoundResult]) -> None:
 
     for r in results:
         print(f"\nRound {r.round_idx}:")
-        print(f"  Selected template: {r.selected_template}")
+        print(f"  Selected strategy (s*): {r.selected_strategy}")
         print(f"  GEPA scores: {r.gepa_results}")
         if r.checkpoint_paths:
-            print(f"  State path: {r.checkpoint_paths.state_path}")
-            print(f"  Sampler path: {r.checkpoint_paths.sampler_path}")
+            print(f"  θ state path: {r.checkpoint_paths.state_path}")
+            print(f"  θ sampler path: {r.checkpoint_paths.sampler_path}")
 
-    # Track template switches
-    templates_used = [r.selected_template for r in results]
-    switches = sum(1 for i in range(1, len(templates_used)) if templates_used[i] != templates_used[i - 1])
-    print(f"\nTemplate switches: {switches}")
-    print(f"Templates used: {' → '.join(templates_used)}")
+    # Track strategy switches
+    strategies_used = [r.selected_strategy for r in results]
+    switches = sum(1 for i in range(1, len(strategies_used)) if strategies_used[i] != strategies_used[i - 1])
+    print(f"\nStrategy switches: {switches}")
+    print(f"Strategy trajectory: {' → '.join(strategies_used)}")
     print("=" * 70)
 
 
