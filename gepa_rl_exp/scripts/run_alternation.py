@@ -1,18 +1,18 @@
 """
 GEPA+RL Alternation: Block coordinate ascent on (s, θ).
 
-Implements the simple alternation loop:
-  1. GEPA phase: Evaluate strategies on current θ, pick winner s*
-  2. RL phase: Train with s* for N batches, update θ
+Implements joint optimization over prompt `s` and model weights `θ`:
+  1. GEPA phase: Use trace-based reflection to optimize prompt s
+  2. RL phase: Train with optimized s for N batches, update θ
   3. Repeat
 
-This is the "one-shot GEPA → RL → GEPA → repeat" pattern for joint
-optimization over prompt strategy `s` and model weights `θ`.
+This uses true GEPA (arxiv:2507.19457) with LLM reflection on execution
+traces, not simple template selection.
 
 Usage:
     cd gepa_rl_exp
     python -m scripts.run_alternation env=arithmetic n_rounds=3 rl_batches_per_round=10
-    python -m scripts.run_alternation env=gsm8k n_rounds=2 rl_batches_per_round=50
+    python -m scripts.run_alternation env=gsm8k n_rounds=2 gepa_iterations=5
 """
 
 import asyncio
@@ -26,18 +26,24 @@ from typing import Literal
 
 import chz
 import tinker
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
 from tinker_cookbook import checkpoint_utils, model_info
-from tinker_cookbook.completers import TinkerTokenCompleter
-from tinker_cookbook.rl.metric_util import dataset_to_env_group_builders
-from tinker_cookbook.rl.problem_env import PromptStrategy
-from tinker_cookbook.rl.rollouts import do_group_rollout
-from tinker_cookbook.rl.train import AsyncConfig, Config, main as rl_main
+from tinker_cookbook.rl.train import Config, main as rl_main
 
 # Add parent to path for src imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from src.prompt_strategy import get_strategy, list_strategies
-from src.prompt_templates import get_strategy_by_name, get_template
+from src.gepa import GEPAConfig, GEPAOptimizer, GEPACandidate
+from src.gepa.config import GEPACandidateMetadata
+from src.gepa.reflection import ReflectionClient, DummyReflectionClient
+from src.prompt_strategy import SystemPromptStrategy, PromptStrategy
 from src.train import get_dataset_builder
+
+# Default seed prompt when GEPA is skipped
+DEFAULT_SEED_PROMPT = "Solve the problem step by step. Show your reasoning clearly."
 
 
 @chz.chz
@@ -55,36 +61,43 @@ class AlternationConfig:
 
     # Alternation schedule
     n_rounds: int = 3  # Number of GEPA→RL cycles
-    rl_batches_per_round: int = 10  # RL training batches per round (U steps)
+    rl_batches_per_round: int = 10  # RL training batches per round
+    skip_first_gepa: bool = False  # Skip GEPA in first round (start with RL-only)
 
-    # GEPA settings - strategy pool for `s` optimization
-    gepa_num_problems: int = 32  # Problems to evaluate per strategy
-    gepa_group_size: int = 4  # Rollouts per problem for GEPA
-    strategies: str = "baseline,step_by_step,concise"  # Comma-separated strategy pool
-    # Legacy alias for backward compatibility
-    templates: str | None = None  # Deprecated: use strategies
+    # GEPA settings (trace-based reflection)
+    gepa_iterations: int = 3  # GEPA optimization steps per round
+    gepa_traces_per_iteration: int = 16  # Problems per GEPA iteration
+    gepa_rollouts_per_problem: int = 4  # Rollouts for trace collection
 
-    # RL settings (passed through to RL training)
+    # Reflection model for GEPA
+    reflection_backend: Literal["openai", "anthropic"] = "anthropic"
+    reflection_model: str = "claude-opus-4-5-20251101"
+    reflection_temperature: float = 0.7
+
+    # RL settings
     rl_group_size: int = 4
     rl_groups_per_batch: int = 100
-    learning_rate: float = 1e-5
+    learning_rate: float = 5e-4  # Recommended for LoRA (was 1e-5, 50x too low)
     max_tokens: int = 256
     temperature: float = 1.0
 
     # Output
     log_path: str | None = None
-    wandb_project: str | None = None
+    wandb_project: str | None = "gepa-rl"  # Default wandb project
 
     # Service
     base_url: str | None = None
+
+    # Debug mode (uses dummy reflection client)
+    debug: bool = False
 
 
 @dataclass
 class CheckpointPaths:
     """Paths to checkpoint artifacts."""
 
-    state_path: str | None  # Full training state (for RL continuation)
-    sampler_path: str | None  # Weights only (for GEPA sampling)
+    state_path: str | None  # Full training state
+    sampler_path: str | None  # Weights only
 
 
 @dataclass
@@ -92,46 +105,78 @@ class RoundResult:
     """Results from one GEPA→RL round."""
 
     round_idx: int
-    gepa_results: dict[str, float]  # strategy_name -> mean_reward
-    selected_strategy: str  # Name of the winning strategy `s*`
+    gepa_best_prompt: str
+    gepa_best_score: float
+    gepa_iterations_run: int
     rl_final_correct_rate: float | None
     checkpoint_paths: CheckpointPaths | None
 
-    # Legacy alias for backward compatibility
-    @property
-    def selected_template(self) -> str:
-        return self.selected_strategy
+
+def create_dataset_builder_factory(
+    config: AlternationConfig,
+    renderer_name: str,
+):
+    """Create factory for building datasets with a given prompt."""
+
+    def factory(prompt: str):
+        strategy = SystemPromptStrategy(
+            system_prompt=prompt,
+            strategy_name="gepa_candidate",
+        )
+
+        return get_dataset_builder(
+            env=config.env,
+            batch_size=1,
+            model_name=config.model_name,
+            renderer_name=renderer_name,
+            group_size=config.gepa_rollouts_per_problem,
+            seed=config.seed,
+            prompt_template="none",
+            n_batches=config.gepa_traces_per_iteration,
+            strategy=strategy,
+        )
+
+    return factory
 
 
 async def run_gepa_phase(
     config: AlternationConfig,
     sampler_path: str | None,
     renderer_name: str,
-    strategy_names: list[str],
-) -> tuple[PromptStrategy, dict[str, float]]:
+    log_path: str,
+    seed_prompt: str | None = None,
+) -> tuple[PromptStrategy, GEPACandidate]:
     """
-    Run GEPA evaluation: evaluate all strategies on current θ.
-
-    This is the `s` optimization step in (s, θ) block coordinate ascent.
+    Run GEPA optimization phase: optimize s using trace-based reflection.
 
     Args:
-        sampler_path: Path to sampler weights (for inference only)
-        strategy_names: List of strategy names to evaluate
+        sampler_path: Path to sampler weights for current θ
+        seed_prompt: Starting prompt (uses previous best or default)
 
     Returns:
-        (winning_strategy, results_dict) where results_dict maps strategy_name -> mean_reward
+        (optimized_strategy, best_candidate)
     """
     print("\n" + "=" * 60)
-    print("GEPA PHASE: Evaluating strategies (optimizing s)")
+    print("GEPA PHASE: Trace-Based Prompt Optimization")
     print("=" * 60)
-    print(f"  Current θ: {sampler_path or 'base model (θ_0)'}")
-    print(f"  Strategies: {strategy_names}")
-    print(f"  Problems per strategy: {config.gepa_num_problems}")
+    print(f"  Current θ: {sampler_path or 'base model'}")
+    print(f"  GEPA iterations: {config.gepa_iterations}")
+    print(f"  Reflection model: {config.reflection_backend}/{config.reflection_model}")
 
-    # Create service client
+    # Create reflection client
+    if config.debug:
+        print("  [DEBUG MODE] Using dummy reflection client")
+        reflection_client = DummyReflectionClient()
+    else:
+        reflection_client = ReflectionClient(
+            backend=config.reflection_backend,
+            model=config.reflection_model,
+            temperature=config.reflection_temperature,
+        )
+
+    # Create service client and sampling client
     service = tinker.ServiceClient()
 
-    # Create sampling client with current weights
     if sampler_path:
         sampling_client = service.create_sampling_client(
             model_path=sampler_path,
@@ -140,65 +185,42 @@ async def run_gepa_phase(
     else:
         sampling_client = service.create_sampling_client(base_model=config.model_name)
 
-    results: dict[str, float] = {}
-    strategies: dict[str, PromptStrategy] = {}
+    # Create dataset builder factory
+    dataset_builder_factory = create_dataset_builder_factory(config, renderer_name)
 
-    for strategy_name in strategy_names:
-        print(f"\n  Evaluating strategy: {strategy_name}")
+    # Create GEPA config
+    gepa_config = GEPAConfig(
+        reflection_backend=config.reflection_backend,
+        reflection_model=config.reflection_model,
+        reflection_temperature=config.reflection_temperature,
+        max_iterations=config.gepa_iterations,
+        traces_per_iteration=config.gepa_traces_per_iteration,
+        rollouts_per_problem=config.gepa_rollouts_per_problem,
+        seed_prompt=seed_prompt,
+        seed=config.seed,
+    )
 
-        # Get the strategy object
-        strategy = get_strategy_by_name(strategy_name)
-        strategies[strategy_name] = strategy
+    # Create and run optimizer
+    optimizer = GEPAOptimizer(
+        config=gepa_config,
+        reflection_client=reflection_client,
+        dataset_builder_factory=dataset_builder_factory,
+        sampling_client=sampling_client,
+        log_path=log_path,
+    )
 
-        # Create dataset builder with this strategy
-        dataset_builder = get_dataset_builder(
-            env=config.env,
-            batch_size=1,
-            model_name=config.model_name,
-            renderer_name=renderer_name,
-            group_size=config.gepa_group_size,
-            seed=config.seed,
-            prompt_template=strategy_name,  # For backward compat
-            n_batches=config.gepa_num_problems,
-            strategy=strategy,
-        )
+    best_candidate = await optimizer.optimize()
 
-        # Build dataset
-        train_dataset, _ = await dataset_builder()
+    # Create strategy from best prompt
+    strategy = SystemPromptStrategy(
+        system_prompt=best_candidate.prompt_text,
+        strategy_name=f"gepa_{best_candidate.candidate_id}",
+    )
 
-        # Get env builders
-        all_env_builders = dataset_to_env_group_builders(train_dataset)
-        env_builders = all_env_builders[: config.gepa_num_problems]
+    print(f"\n  Best prompt: {best_candidate.prompt_text[:100]}...")
+    print(f"  Best score: {best_candidate.best_score:.1%}")
 
-        # Create policy
-        policy = TinkerTokenCompleter(
-            sampling_client=sampling_client,
-            max_tokens=config.max_tokens,
-            temperature=config.temperature,
-        )
-
-        # Run rollouts
-        trajectory_groups = await asyncio.gather(
-            *[do_group_rollout(builder, policy) for builder in env_builders]
-        )
-
-        # Compute mean reward
-        all_rewards: list[float] = []
-        for traj_group in trajectory_groups:
-            for traj in traj_group.trajectories_G:
-                episode_reward = sum(t.reward for t in traj.transitions)
-                all_rewards.append(episode_reward)
-
-        mean_reward = sum(all_rewards) / len(all_rewards) if all_rewards else 0.0
-        results[strategy_name] = mean_reward
-        print(f"    Mean reward: {mean_reward:.3f}")
-
-    # Select winner (s*)
-    winner_name = max(results, key=lambda s: results[s])
-    winner = strategies[winner_name]
-    print(f"\n  WINNER: s* = {winner_name} (reward={results[winner_name]:.3f})")
-
-    return winner, results
+    return strategy, best_candidate
 
 
 async def run_rl_phase(
@@ -212,21 +234,14 @@ async def run_rl_phase(
     """
     Run RL training phase with selected strategy.
 
-    This is the `θ` optimization step in (s, θ) block coordinate ascent.
-
-    Args:
-        strategy: The selected prompt strategy s* from GEPA phase
-        state_path: Path to full training state (weights + optimizer) for continuation
-
-    Returns:
-        CheckpointPaths with both state_path and sampler_path, or None if training failed
+    This is the θ optimization step in (s, θ) block coordinate ascent.
     """
     print("\n" + "=" * 60)
-    print(f"RL PHASE: Training θ with strategy s* = '{strategy.name}'")
+    print(f"RL PHASE: Training θ with optimized prompt")
     print("=" * 60)
+    print(f"  Strategy: {strategy.name}")
     print(f"  Batches: {config.rl_batches_per_round}")
     print(f"  Starting θ from: {state_path or 'base model'}")
-    print(f"  Log path: {round_log_path}")
 
     # Build RL config with the strategy
     rl_config = Config(
@@ -237,28 +252,28 @@ async def run_rl_phase(
             model_name=config.model_name,
             renderer_name=renderer_name,
             group_size=config.rl_group_size,
-            seed=config.seed + round_idx,  # Vary seed per round
-            prompt_template=strategy.name,  # For logging/backward compat
+            seed=config.seed,  # Use same seed across rounds for fair comparison
+            prompt_template="none",
             n_batches=config.rl_batches_per_round,
-            strategy=strategy,  # First-class strategy object
+            strategy=strategy,
         ),
         model_name=config.model_name,
         lora_rank=config.lora_rank,
         max_tokens=config.max_tokens,
         temperature=config.temperature,
         wandb_project=config.wandb_project,
-        wandb_name=f"round{round_idx}-{strategy.name}" if config.wandb_project else None,
+        wandb_name=None,
         log_path=round_log_path,
         base_url=config.base_url,
         load_checkpoint_path=state_path,
         eval_every=max(1, config.rl_batches_per_round // 2),
-        save_every=config.rl_batches_per_round,  # Save at end
+        save_every=config.rl_batches_per_round,
     )
 
     # Run training
     await rl_main(rl_config)
 
-    # Get checkpoint paths from the saved checkpoints
+    # Get checkpoint paths
     last_checkpoint = checkpoint_utils.get_last_checkpoint(
         round_log_path, required_key="sampler_path"
     )
@@ -271,26 +286,23 @@ async def run_rl_phase(
 
 
 async def run_alternation(config: AlternationConfig) -> list[RoundResult]:
-    """Run the full GEPA+RL alternation loop on (s, θ)."""
+    """Run the full GEPA+RL alternation loop."""
 
     print("=" * 70)
-    print("GEPA+RL ALTERNATION: Block coordinate ascent on (s, θ)")
+    print("GEPA+RL ALTERNATION: Block Coordinate Ascent on (s, θ)")
     print("=" * 70)
-    print(f"Model (θ base): {config.model_name}")
+    print(f"Model: {config.model_name}")
     print(f"Environment: {config.env}")
     print(f"Rounds: {config.n_rounds}")
-    print(f"RL batches per round (θ steps): {config.rl_batches_per_round}")
+    print(f"GEPA iterations per round: {config.gepa_iterations}")
+    print(f"RL batches per round: {config.rl_batches_per_round}")
+    print(f"Reflection model: {config.reflection_backend}/{config.reflection_model}")
     print("=" * 70)
 
     # Setup
     renderer_name = config.renderer_name or model_info.get_recommended_renderer_name(
         config.model_name
     )
-
-    # Parse strategy pool - support both 'strategies' and legacy 'templates'
-    strategy_str = config.templates if config.templates else config.strategies
-    strategy_names = [s.strip() for s in strategy_str.split(",")]
-    print(f"Strategy pool: {strategy_names}")
 
     # Determine base log path
     if config.log_path:
@@ -303,8 +315,34 @@ async def run_alternation(config: AlternationConfig) -> list[RoundResult]:
     base_log_path = os.path.expanduser(base_log_path)
     os.makedirs(base_log_path, exist_ok=True)
 
-    # State: track both θ paths and current s
+    # Initialize wandb
+    wandb_run = None
+    if config.wandb_project and wandb is not None:
+        # Determine mode for easy comparison
+        mode = "gepa_rl" if config.gepa_iterations > 0 else "rl_only"
+        wandb_run = wandb.init(
+            project=config.wandb_project,
+            name=os.path.basename(base_log_path),
+            tags=[mode, config.env],
+            config={
+                "mode": mode,
+                "model_name": config.model_name,
+                "env": config.env,
+                "n_rounds": config.n_rounds,
+                "gepa_iterations": config.gepa_iterations,
+                "skip_first_gepa": config.skip_first_gepa,
+                "rl_batches_per_round": config.rl_batches_per_round,
+                "rl_groups_per_batch": config.rl_groups_per_batch,
+                "rl_group_size": config.rl_group_size,
+                "total_rl_batches": config.n_rounds * config.rl_batches_per_round,
+                "reflection_model": f"{config.reflection_backend}/{config.reflection_model}" if config.gepa_iterations > 0 else "none",
+            },
+            dir=base_log_path,
+        )
+
+    # State
     current_paths: CheckpointPaths | None = None
+    current_best_prompt: str | None = None
     results: list[RoundResult] = []
 
     for round_idx in range(config.n_rounds):
@@ -313,81 +351,124 @@ async def run_alternation(config: AlternationConfig) -> list[RoundResult]:
         print(f"{'#' * 70}")
 
         # 1. GEPA phase: optimize s with θ fixed
-        # Use sampler_path for inference
+        # Skip GEPA in first round if configured (to let RL train first)
+        skip_gepa_this_round = (round_idx == 0 and config.skip_first_gepa)
+
         sampler_path = current_paths.sampler_path if current_paths else None
-        selected_strategy, gepa_results = await run_gepa_phase(
-            config=config,
-            sampler_path=sampler_path,
-            renderer_name=renderer_name,
-            strategy_names=strategy_names,
-        )
+        gepa_log_path = os.path.join(base_log_path, f"round{round_idx}_gepa")
+        os.makedirs(gepa_log_path, exist_ok=True)
+
+        if skip_gepa_this_round:
+            print("\n" + "=" * 60)
+            print("GEPA PHASE: Skipped (skip_first_gepa=True)")
+            print("=" * 60)
+            # Use default seed prompt
+            gepa_candidate = GEPACandidate(
+                prompt_text=DEFAULT_SEED_PROMPT,
+                metadata=GEPACandidateMetadata(
+                    candidate_id="seed",
+                    parent_id=None,
+                    iteration_created=0,
+                    proposal_reasoning="Default seed prompt (GEPA skipped)",
+                ),
+                scores=[0.0],
+                best_score=0.0,
+                avg_score=0.0,
+            )
+            strategy = SystemPromptStrategy(
+                system_prompt=DEFAULT_SEED_PROMPT,
+                strategy_name="seed_prompt",
+            )
+        else:
+            strategy, gepa_candidate = await run_gepa_phase(
+                config=config,
+                sampler_path=sampler_path,
+                renderer_name=renderer_name,
+                log_path=gepa_log_path,
+                seed_prompt=current_best_prompt,
+            )
+
+        # Update best prompt for next round
+        current_best_prompt = gepa_candidate.prompt_text
+
+        # Log GEPA results to wandb
+        if wandb_run is not None and wandb is not None:
+            wandb.log({
+                "round": round_idx,
+                "gepa/best_score": gepa_candidate.best_score,
+                "gepa/iterations": gepa_candidate.metadata.iteration_created,
+                "gepa/skipped": skip_gepa_this_round,
+            })
 
         # 2. RL phase: optimize θ with s fixed
-        # Use state_path for training continuation
         state_path = current_paths.state_path if current_paths else None
-        round_log_path = os.path.join(base_log_path, f"round{round_idx}")
+        rl_log_path = os.path.join(base_log_path, f"round{round_idx}_rl")
+
         new_paths = await run_rl_phase(
             config=config,
-            strategy=selected_strategy,
+            strategy=strategy,
             round_idx=round_idx,
             state_path=state_path,
             renderer_name=renderer_name,
-            round_log_path=round_log_path,
+            round_log_path=rl_log_path,
         )
 
         # Record results
         result = RoundResult(
             round_idx=round_idx,
-            gepa_results=gepa_results,
-            selected_strategy=selected_strategy.name,
-            rl_final_correct_rate=None,  # Could parse from metrics.jsonl
+            gepa_best_prompt=gepa_candidate.prompt_text,
+            gepa_best_score=gepa_candidate.best_score,
+            gepa_iterations_run=gepa_candidate.metadata.iteration_created,
+            rl_final_correct_rate=None,
             checkpoint_paths=new_paths,
         )
         results.append(result)
 
-        # Update state for next round
+        # Update state
         current_paths = new_paths
 
-        # Save round summary with both s and θ state
+        # Save round summary
         summary_path = os.path.join(base_log_path, "alternation_log.jsonl")
         with open(summary_path, "a") as f:
             f.write(
-                json.dumps(
-                    {
-                        "round": round_idx,
-                        "gepa_results": gepa_results,
-                        "selected_strategy": selected_strategy.name,
-                        # Legacy field for backward compatibility
-                        "selected_template": selected_strategy.name,
-                        "state_path": new_paths.state_path if new_paths else None,
-                        "sampler_path": new_paths.sampler_path if new_paths else None,
-                    }
-                )
+                json.dumps({
+                    "round": round_idx,
+                    "gepa_best_prompt": gepa_candidate.prompt_text,
+                    "gepa_best_score": gepa_candidate.best_score,
+                    "gepa_candidate_id": gepa_candidate.candidate_id,
+                    "state_path": new_paths.state_path if new_paths else None,
+                    "sampler_path": new_paths.sampler_path if new_paths else None,
+                })
                 + "\n"
             )
+
+    # Close wandb
+    if wandb_run is not None and wandb is not None:
+        wandb.finish()
 
     return results
 
 
 def print_summary(results: list[RoundResult]) -> None:
-    """Print final summary of alternation run."""
+    """Print final summary."""
     print("\n" + "=" * 70)
     print("ALTERNATION SUMMARY")
     print("=" * 70)
 
     for r in results:
         print(f"\nRound {r.round_idx}:")
-        print(f"  Selected strategy (s*): {r.selected_strategy}")
-        print(f"  GEPA scores: {r.gepa_results}")
+        print(f"  GEPA best score: {r.gepa_best_score:.1%}")
+        print(f"  GEPA iterations: {r.gepa_iterations_run}")
+        print(f"  Best prompt: {r.gepa_best_prompt[:80]}...")
         if r.checkpoint_paths:
-            print(f"  θ state path: {r.checkpoint_paths.state_path}")
-            print(f"  θ sampler path: {r.checkpoint_paths.sampler_path}")
+            print(f"  θ sampler: {r.checkpoint_paths.sampler_path}")
 
-    # Track strategy switches
-    strategies_used = [r.selected_strategy for r in results]
-    switches = sum(1 for i in range(1, len(strategies_used)) if strategies_used[i] != strategies_used[i - 1])
-    print(f"\nStrategy switches: {switches}")
-    print(f"Strategy trajectory: {' → '.join(strategies_used)}")
+    # Track prompt evolution
+    prompts = [r.gepa_best_prompt[:50] + "..." for r in results]
+    print(f"\nPrompt evolution:")
+    for i, p in enumerate(prompts):
+        print(f"  Round {i}: {p}")
+
     print("=" * 70)
 
 

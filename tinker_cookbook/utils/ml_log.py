@@ -217,14 +217,26 @@ class WandbLogger(Logger):
         if not os.environ.get("WANDB_API_KEY"):
             raise ValueError("WANDB_API_KEY environment variable not set")
 
-        # Initialize wandb run
         assert wandb is not None  # For type checker
-        self.run = wandb.init(
-            project=project,
-            config=dump_config(config) if config else None,
-            dir=str(log_dir) if log_dir else None,
-            name=wandb_name,
-        )
+
+        # Check if there's already an active wandb run (e.g., from alternation script)
+        # If so, reuse it instead of creating a new one
+        if wandb.run is not None:
+            self.run = wandb.run
+            self._owns_run = False  # Don't close this run - we're borrowing it
+            logger.info("Reusing existing wandb run: %s", self.run.url)
+            # Still update config with this phase's settings
+            if config:
+                wandb.config.update(dump_config(config), allow_val_change=True)
+        else:
+            # Initialize new wandb run
+            self.run = wandb.init(
+                project=project,
+                config=dump_config(config) if config else None,
+                dir=str(log_dir) if log_dir else None,
+                name=wandb_name,
+            )
+            self._owns_run = True  # We created this run, so we should close it
 
     def log_hparams(self, config: Any) -> None:
         """Log hyperparameters to wandb."""
@@ -234,12 +246,17 @@ class WandbLogger(Logger):
     def log_metrics(self, metrics: Dict[str, Any], step: int | None = None) -> None:
         """Log metrics to wandb."""
         if self.run and wandb is not None:
-            wandb.log(metrics, step=step)
+            # When reusing an existing run, don't pass step - let wandb auto-increment
+            # This ensures continuous step numbering across phases
+            if self._owns_run:
+                wandb.log(metrics, step=step)
+            else:
+                wandb.log(metrics)  # No step - wandb auto-increments
             logger.info("Logging to: %s", self.run.url)
 
     def close(self) -> None:
-        """Close wandb run."""
-        if self.run and wandb is not None:
+        """Close wandb run (only if we created it)."""
+        if self.run and wandb is not None and self._owns_run:
             wandb.finish()
 
     def get_logger_url(self) -> str | None:

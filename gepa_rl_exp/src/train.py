@@ -25,9 +25,39 @@ from tinker_cookbook.recipes.math_rl.math_env import (
 )
 from tinker_cookbook.rl.problem_env import PromptStrategy
 from tinker_cookbook.rl.train import AsyncConfig, Config, main
-from tinker_cookbook.rl.types import RLDatasetBuilder
+from tinker_cookbook.rl.types import EnvGroupBuilder, RLDataset, RLDatasetBuilder
+from typing import Sequence
 
 from .prompt_strategy import FewShotStrategy, NoPromptStrategy
+
+
+class LimitedDataset(RLDataset):
+    """Wrapper that limits the number of batches from a dataset."""
+
+    def __init__(self, dataset: RLDataset, n_batches: int):
+        self._dataset = dataset
+        self._n_batches = n_batches
+
+    def __len__(self) -> int:
+        return min(len(self._dataset), self._n_batches)
+
+    def get_batch(self, index: int) -> Sequence[EnvGroupBuilder]:
+        if index >= self._n_batches:
+            raise IndexError(f"Index {index} out of range for limited dataset of size {self._n_batches}")
+        return self._dataset.get_batch(index)
+
+
+@chz.chz
+class LimitedDatasetBuilder(RLDatasetBuilder):
+    """Wrapper that limits the number of batches from a dataset builder."""
+
+    inner_builder: RLDatasetBuilder
+    n_batches: int
+
+    async def __call__(self) -> tuple[RLDataset, RLDataset | None]:
+        train_dataset, test_dataset = await self.inner_builder()
+        limited_train = LimitedDataset(train_dataset, self.n_batches)
+        return limited_train, test_dataset
 from .prompt_templates import get_strategy_by_name, get_template
 
 
@@ -47,7 +77,12 @@ class MathRLConfig:
     n_batches: int | None = None  # For arithmetic env: limit number of batches
 
     # Prompt template configuration
-    prompt_template: Literal["baseline", "step_by_step", "concise", "none"] = "baseline"
+    # GSM8K/MATH: baseline, step_by_step, concise, none (use \boxed{} format)
+    # Arithmetic: arith_baseline, arith_step_by_step, arith_concise (number-first format)
+    prompt_template: Literal[
+        "baseline", "step_by_step", "concise", "none",
+        "arith_baseline", "arith_step_by_step", "arith_concise"
+    ] = "baseline"
 
     # Training hyperparameters
     group_size: int = 4
@@ -134,7 +169,7 @@ def get_dataset_builder(
             strategy=strategy,
         )
     elif env == "gsm8k":
-        return Gsm8kDatasetBuilder(
+        inner_builder = Gsm8kDatasetBuilder(
             batch_size=batch_size,
             model_name_for_tokenizer=model_name,
             renderer_name=renderer_name,
@@ -143,8 +178,11 @@ def get_dataset_builder(
             seed=seed,
             strategy=strategy,
         )
+        if n_batches is not None:
+            return LimitedDatasetBuilder(inner_builder=inner_builder, n_batches=n_batches)
+        return inner_builder
     elif env == "math":
-        return MathDatasetBuilder(
+        inner_builder = MathDatasetBuilder(
             batch_size=batch_size,
             model_name_for_tokenizer=model_name,
             renderer_name=renderer_name,
@@ -153,6 +191,9 @@ def get_dataset_builder(
             seed=seed,
             strategy=strategy,
         )
+        if n_batches is not None:
+            return LimitedDatasetBuilder(inner_builder=inner_builder, n_batches=n_batches)
+        return inner_builder
     else:
         raise ValueError(f"Unknown environment: {env}. Supported: arithmetic, gsm8k, math")
 

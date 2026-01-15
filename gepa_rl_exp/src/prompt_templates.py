@@ -9,8 +9,7 @@ The strategies here are examples for math tasks, but the PromptStrategy
 interface is dataset-agnostic.
 """
 
-from dataclasses import dataclass, field
-from typing import Callable, Literal
+from typing import Literal
 
 from .prompt_strategy import (
     FewShotStrategy,
@@ -27,7 +26,7 @@ TemplateName = Literal["baseline", "step_by_step", "concise", "none"]
 
 
 # =============================================================================
-# Few-shot example definitions
+# Few-shot example definitions for GSM8K/MATH (uses \boxed{} format)
 # =============================================================================
 
 BASELINE_FEWSHOT: list[Message] = [
@@ -81,6 +80,44 @@ CONCISE_FEWSHOT: list[Message] = [
 
 
 # =============================================================================
+# Few-shot example definitions for Arithmetic env (just output the number)
+# =============================================================================
+
+ARITH_BASELINE_FEWSHOT: list[Message] = [
+    {
+        "role": "user",
+        "content": "What is 4 + 5?",
+    },
+    {
+        "role": "assistant",
+        "content": "9",
+    },
+]
+
+ARITH_STEP_BY_STEP_FEWSHOT: list[Message] = [
+    {
+        "role": "user",
+        "content": "What is 37 + 48?",
+    },
+    {
+        "role": "assistant",
+        "content": "85\n\nWorking: 37 + 48 = 37 + 50 - 2 = 87 - 2 = 85",
+    },
+]
+
+ARITH_CONCISE_FEWSHOT: list[Message] = [
+    {
+        "role": "user",
+        "content": "What is 12 + 7?",
+    },
+    {
+        "role": "assistant",
+        "content": "19",
+    },
+]
+
+
+# =============================================================================
 # Strategy instances
 # =============================================================================
 
@@ -114,11 +151,41 @@ def create_no_prompt_strategy() -> PromptStrategy:
     return NoPromptStrategy(strategy_name="none")
 
 
-# Register strategies
+# Arithmetic-specific strategies (output number first)
+def create_arith_baseline_strategy() -> PromptStrategy:
+    """Arithmetic baseline - just output the number."""
+    return FewShotStrategy(
+        fewshot_messages=ARITH_BASELINE_FEWSHOT,
+        strategy_name="arith_baseline",
+    )
+
+
+def create_arith_step_by_step_strategy() -> PromptStrategy:
+    """Arithmetic step-by-step - number first, then explanation."""
+    return FewShotStrategy(
+        fewshot_messages=ARITH_STEP_BY_STEP_FEWSHOT,
+        strategy_name="arith_step_by_step",
+    )
+
+
+def create_arith_concise_strategy() -> PromptStrategy:
+    """Arithmetic concise - just the number."""
+    return FewShotStrategy(
+        fewshot_messages=ARITH_CONCISE_FEWSHOT,
+        strategy_name="arith_concise",
+    )
+
+
+# Register strategies - GSM8K/MATH (boxed format)
 register_strategy("baseline", create_baseline_strategy)
 register_strategy("step_by_step", create_step_by_step_strategy)
 register_strategy("concise", create_concise_strategy)
 register_strategy("none", create_no_prompt_strategy)
+
+# Register strategies - Arithmetic (number-first format)
+register_strategy("arith_baseline", create_arith_baseline_strategy)
+register_strategy("arith_step_by_step", create_arith_step_by_step_strategy)
+register_strategy("arith_concise", create_arith_concise_strategy)
 
 
 # =============================================================================

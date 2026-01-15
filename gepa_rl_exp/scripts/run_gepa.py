@@ -1,18 +1,25 @@
 """
-GEPA Phase 1: Prompt template comparison on fixed weights.
+GEPA: Trace-based reflective prompt optimization.
 
-Evaluates different prompt templates by running rollouts and comparing
-mean reward and format success rate. Used to select the best template
-before (or during) RL training.
+Implements the GEPA algorithm (arxiv:2507.19457) for optimizing prompts
+by analyzing execution traces and using LLM reflection to propose
+targeted improvements.
+
+This replaces the old template-selection approach with true GEPA:
+1. Collect execution traces with current prompt
+2. Reflection LM analyzes traces to diagnose failures
+3. Reflection LM proposes targeted prompt improvement
+4. Evaluate and iterate
 
 Usage:
     cd gepa_rl_exp
-    python -m scripts.run_gepa env=arithmetic
-    python -m scripts.run_gepa env=gsm8k num_problems=50
+    python -m scripts.run_gepa env=arithmetic max_iterations=5
+    python -m scripts.run_gepa env=gsm8k reflection_model=gpt-4o
 """
 
 import asyncio
 import json
+import os
 import sys
 from dataclasses import dataclass
 from datetime import datetime
@@ -21,166 +28,158 @@ from typing import Literal
 
 import chz
 import tinker
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
 from tinker_cookbook import model_info
-from tinker_cookbook.completers import TinkerTokenCompleter
-from tinker_cookbook.rl.metric_util import compute_trajectory_metrics, dataset_to_env_group_builders
-from tinker_cookbook.rl.rollouts import do_group_rollout
+from tinker_cookbook.rl.metric_util import dataset_to_env_group_builders
 
 # Add parent to path for src imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
+from src.gepa import GEPAConfig, GEPAOptimizer, GEPACandidate
+from src.gepa.reflection import ReflectionClient, DummyReflectionClient
 from src.train import get_dataset_builder
+from src.prompt_strategy import SystemPromptStrategy
 
 
 @chz.chz
-class GEPAConfig:
-    """Configuration for GEPA prompt evaluation."""
+class RunGEPAConfig:
+    """Configuration for running GEPA optimization."""
 
     # Model configuration
     model_name: str = "Qwen/Qwen3-8B"
-    checkpoint_path: str | None = None  # If None, use base model (θ_0)
+    checkpoint_path: str | None = None  # If None, use base model
     renderer_name: str | None = None
 
     # Environment
     env: Literal["arithmetic", "gsm8k", "math"] = "arithmetic"
     seed: int = 0
 
-    # Evaluation settings
-    num_problems: int = 32  # Number of problems to evaluate per template
-    group_size: int = 4  # Rollouts per problem (for variance estimation)
-    max_tokens: int = 128
+    # GEPA settings
+    max_iterations: int = 5  # Number of GEPA optimization steps
+    traces_per_iteration: int = 16  # Problems per iteration
+    rollouts_per_problem: int = 4  # For variance estimation
+    pool_size: int = 5  # Max candidates in pool
+    min_improvement_threshold: float = 0.01
+
+    # Reflection model
+    reflection_backend: Literal["openai", "anthropic"] = "anthropic"
+    reflection_model: str = "claude-opus-4-5-20251101"
+    reflection_temperature: float = 0.7
+
+    # Seed prompt (starting point for optimization)
+    seed_prompt: str | None = None
+
+    # Sampling settings
+    max_tokens: int = 256
     temperature: float = 1.0
 
-    # Templates to compare
-    templates: str = "baseline,step_by_step,concise"  # Comma-separated
-
     # Output
-    output_path: str | None = None  # If None, print to stdout
+    log_path: str | None = None
+    log_traces: bool = True
+    log_proposals: bool = True
+    wandb_project: str | None = "gepa-rl"  # Default wandb project
+
+    # Debug mode (uses dummy reflection client)
+    debug: bool = False
 
 
-@dataclass
-class TemplateResult:
-    """Results for a single template evaluation."""
-
-    template: str
-    mean_reward: float
-    std_reward: float
-    format_success_rate: float
-    correct_rate: float
-    num_episodes: int
-    avg_tokens_per_episode: float
-
-
-async def evaluate_template(
-    sampling_client: tinker.SamplingClient,
-    template: str,
-    config: GEPAConfig,
+def create_dataset_builder_factory(
+    config: RunGEPAConfig,
     renderer_name: str,
-) -> TemplateResult:
-    """Evaluate a single template by running rollouts."""
+):
+    """
+    Create a factory function that builds datasets with a given prompt.
 
-    print(f"\n  Evaluating template: {template}")
+    The factory takes a prompt string and returns a dataset builder
+    configured with that prompt as the system prompt.
+    """
 
-    # Create dataset builder with this template
-    dataset_builder = get_dataset_builder(
-        env=config.env,
-        batch_size=1,  # One group at a time
-        model_name=config.model_name,
-        renderer_name=renderer_name,
-        group_size=config.group_size,
-        seed=config.seed,
-        prompt_template=template,
-        n_batches=config.num_problems,  # For arithmetic env
-    )
+    def factory(prompt: str):
+        # Create a strategy with the given prompt
+        strategy = SystemPromptStrategy(
+            system_prompt=prompt,
+            strategy_name="gepa_candidate",
+        )
 
-    # Build the dataset (async) - returns (train_dataset, test_dataset)
-    train_dataset, _ = await dataset_builder()
+        return get_dataset_builder(
+            env=config.env,
+            batch_size=1,
+            model_name=config.model_name,
+            renderer_name=renderer_name,
+            group_size=config.rollouts_per_problem,
+            seed=config.seed,
+            prompt_template="none",  # Use strategy instead
+            n_batches=config.traces_per_iteration,
+            strategy=strategy,
+        )
 
-    # Get env group builders from dataset
-    all_env_builders = dataset_to_env_group_builders(train_dataset)
-    env_builders = all_env_builders[: config.num_problems]
-
-    print(f"    Evaluating {len(env_builders)} problems...")
-
-    # Create policy from sampling client
-    policy = TinkerTokenCompleter(
-        sampling_client=sampling_client,
-        max_tokens=config.max_tokens,
-        temperature=config.temperature,
-    )
-
-    # Run rollouts for all problems
-    trajectory_groups = await asyncio.gather(
-        *[do_group_rollout(builder, policy) for builder in env_builders]
-    )
-
-    # Collect results
-    all_rewards: list[float] = []
-    all_correct: list[float] = []
-    all_format_ok: list[float] = []
-    all_tokens: list[int] = []
-
-    for trajectory_group in trajectory_groups:
-        # Extract metrics from each trajectory in the group
-        for traj in trajectory_group.trajectories_G:
-            # Total reward for this episode
-            episode_reward = sum(t.reward for t in traj.transitions)
-            all_rewards.append(episode_reward)
-
-            # Check for correct/format metrics in transitions
-            for t in traj.transitions:
-                if "correct" in t.metrics:
-                    all_correct.append(float(t.metrics["correct"]))
-                if "format" in t.metrics:
-                    all_format_ok.append(float(t.metrics["format"]))
-
-            # Token count (ac.tokens is the token list)
-            total_tokens = sum(len(t.ac.tokens) for t in traj.transitions)
-            all_tokens.append(total_tokens)
-
-    # Compute statistics
-    mean_reward = sum(all_rewards) / len(all_rewards) if all_rewards else 0.0
-    std_reward = (
-        (sum((r - mean_reward) ** 2 for r in all_rewards) / len(all_rewards)) ** 0.5
-        if len(all_rewards) > 1
-        else 0.0
-    )
-    format_rate = sum(all_format_ok) / len(all_format_ok) if all_format_ok else 1.0
-    correct_rate = sum(all_correct) / len(all_correct) if all_correct else 0.0
-    avg_tokens = sum(all_tokens) / len(all_tokens) if all_tokens else 0.0
-
-    return TemplateResult(
-        template=template,
-        mean_reward=mean_reward,
-        std_reward=std_reward,
-        format_success_rate=format_rate,
-        correct_rate=correct_rate,
-        num_episodes=len(all_rewards),
-        avg_tokens_per_episode=avg_tokens,
-    )
+    return factory
 
 
-async def run_gepa(config: GEPAConfig) -> list[TemplateResult]:
-    """Run GEPA evaluation across all templates."""
+async def run_gepa(config: RunGEPAConfig) -> GEPACandidate:
+    """
+    Run GEPA optimization.
 
+    Uses trace-based reflection to iteratively improve prompts.
+    """
     print("=" * 60)
-    print("GEPA Phase 1: Prompt Template Comparison")
+    print("GEPA: Trace-Based Reflective Prompt Optimization")
     print("=" * 60)
     print(f"Model: {config.model_name}")
-    print(f"Checkpoint: {config.checkpoint_path or 'base model (θ_0)'}")
+    print(f"Checkpoint: {config.checkpoint_path or 'base model'}")
     print(f"Environment: {config.env}")
-    print(f"Problems per template: {config.num_problems}")
-    print(f"Rollouts per problem: {config.group_size}")
+    print(f"Max iterations: {config.max_iterations}")
+    print(f"Reflection model: {config.reflection_backend}/{config.reflection_model}")
     print("=" * 60)
 
-    # Parse templates
-    templates = [t.strip() for t in config.templates.split(",")]
-    print(f"Templates to evaluate: {templates}")
+    # Setup log path
+    if config.log_path:
+        log_path = config.log_path
+    else:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        wrapper_root = Path(__file__).parent.parent
+        log_path = str(wrapper_root / "runs" / f"gepa-{timestamp}")
+
+    log_path = os.path.expanduser(log_path)
+    os.makedirs(log_path, exist_ok=True)
+    print(f"Log path: {log_path}")
+
+    # Initialize wandb
+    wandb_run = None
+    if config.wandb_project and wandb is not None:
+        wandb_run = wandb.init(
+            project=config.wandb_project,
+            name=os.path.basename(log_path),
+            config={
+                "model_name": config.model_name,
+                "env": config.env,
+                "max_iterations": config.max_iterations,
+                "traces_per_iteration": config.traces_per_iteration,
+                "reflection_model": f"{config.reflection_backend}/{config.reflection_model}",
+            },
+            dir=log_path,
+        )
+        print(f"Wandb: {config.wandb_project}")
 
     # Auto-detect renderer
     renderer_name = config.renderer_name or model_info.get_recommended_renderer_name(
         config.model_name
     )
     print(f"Renderer: {renderer_name}")
+
+    # Create reflection client
+    if config.debug:
+        print("\n[DEBUG MODE] Using dummy reflection client")
+        reflection_client = DummyReflectionClient()
+    else:
+        reflection_client = ReflectionClient(
+            backend=config.reflection_backend,
+            model=config.reflection_model,
+            temperature=config.reflection_temperature,
+        )
 
     # Create service client
     service = tinker.ServiceClient()
@@ -193,89 +192,100 @@ async def run_gepa(config: GEPAConfig) -> list[TemplateResult]:
             base_model=config.model_name,
         )
     else:
-        print("\nUsing base model (θ_0)")
+        print("\nUsing base model")
         sampling_client = service.create_sampling_client(base_model=config.model_name)
 
-    # Evaluate each template
-    results: list[TemplateResult] = []
-    for template in templates:
-        result = await evaluate_template(
-            sampling_client=sampling_client,
-            template=template,
-            config=config,
-            renderer_name=renderer_name,
-        )
-        results.append(result)
+    # Create dataset builder factory
+    dataset_builder_factory = create_dataset_builder_factory(config, renderer_name)
 
-    return results
-
-
-def print_results(results: list[TemplateResult]) -> str:
-    """Print results table and return winner."""
-
-    print("\n" + "=" * 60)
-    print("RESULTS")
-    print("=" * 60)
-
-    # Header
-    print(
-        f"{'Template':<15} {'Reward':>10} {'Std':>8} {'Correct':>10} {'Format':>10} {'Tokens':>8}"
+    # Create GEPA config
+    gepa_config = GEPAConfig(
+        reflection_backend=config.reflection_backend,
+        reflection_model=config.reflection_model,
+        reflection_temperature=config.reflection_temperature,
+        max_iterations=config.max_iterations,
+        traces_per_iteration=config.traces_per_iteration,
+        rollouts_per_problem=config.rollouts_per_problem,
+        pool_size=config.pool_size,
+        min_improvement_threshold=config.min_improvement_threshold,
+        seed_prompt=config.seed_prompt,
+        log_traces=config.log_traces,
+        log_proposals=config.log_proposals,
+        seed=config.seed,
     )
-    print("-" * 60)
 
-    # Sort by mean reward (descending)
-    sorted_results = sorted(results, key=lambda r: r.mean_reward, reverse=True)
+    # Create optimizer
+    optimizer = GEPAOptimizer(
+        config=gepa_config,
+        reflection_client=reflection_client,
+        dataset_builder_factory=dataset_builder_factory,
+        sampling_client=sampling_client,
+        log_path=log_path,
+    )
 
-    for r in sorted_results:
-        print(
-            f"{r.template:<15} {r.mean_reward:>10.3f} {r.std_reward:>8.3f} "
-            f"{r.correct_rate:>9.1%} {r.format_success_rate:>9.1%} {r.avg_tokens_per_episode:>8.1f}"
-        )
+    # Run optimization
+    best_candidate = await optimizer.optimize()
 
-    winner = sorted_results[0]
-    print("-" * 60)
-    print(f"WINNER: {winner.template} (reward={winner.mean_reward:.3f})")
-    print("=" * 60)
-
-    return winner.template
-
-
-def save_results(results: list[TemplateResult], output_path: str) -> None:
-    """Save results to JSON file."""
-    data = {
-        "timestamp": datetime.now().isoformat(),
-        "results": [
-            {
-                "template": r.template,
-                "mean_reward": r.mean_reward,
-                "std_reward": r.std_reward,
-                "format_success_rate": r.format_success_rate,
-                "correct_rate": r.correct_rate,
-                "num_episodes": r.num_episodes,
-                "avg_tokens_per_episode": r.avg_tokens_per_episode,
-            }
-            for r in results
-        ],
-        "winner": max(results, key=lambda r: r.mean_reward).template,
+    # Save final results
+    results = {
+        "best_prompt": best_candidate.prompt_text,
+        "best_score": best_candidate.best_score,
+        "avg_score": best_candidate.avg_score,
+        "candidate_id": best_candidate.candidate_id,
+        "metadata": best_candidate.metadata.to_dict(),
+        "total_iterations": optimizer.iteration,
+        "config": {
+            "model_name": config.model_name,
+            "env": config.env,
+            "max_iterations": config.max_iterations,
+            "reflection_model": f"{config.reflection_backend}/{config.reflection_model}",
+        },
     }
 
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "w") as f:
-        json.dump(data, f, indent=2)
-    print(f"\nResults saved to: {output_path}")
+    results_path = os.path.join(log_path, "gepa_results.json")
+    with open(results_path, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"\nResults saved to: {results_path}")
+
+    # Save optimizer state for potential resume
+    state_path = os.path.join(log_path, "gepa_state.json")
+    with open(state_path, "w") as f:
+        json.dump(optimizer.get_state(), f, indent=2)
+
+    # Log final results to wandb
+    if wandb_run is not None and wandb is not None:
+        wandb.log({
+            "final/best_score": best_candidate.best_score,
+            "final/avg_score": best_candidate.avg_score,
+            "final/iterations": optimizer.iteration,
+        })
+        wandb.finish()
+
+    return best_candidate
+
+
+def print_results(candidate: GEPACandidate) -> None:
+    """Print final results."""
+    print("\n" + "=" * 60)
+    print("GEPA OPTIMIZATION RESULTS")
+    print("=" * 60)
+    print(f"\nBest prompt:")
+    print("-" * 40)
+    print(candidate.prompt_text)
+    print("-" * 40)
+    print(f"\nBest score: {candidate.best_score:.1%}")
+    print(f"Average score: {candidate.avg_score:.1%}")
+    print(f"Candidate ID: {candidate.candidate_id}")
+    if candidate.metadata.failure_patterns:
+        print(f"Addressed patterns: {candidate.metadata.failure_patterns}")
+    print("=" * 60)
 
 
 def main() -> None:
     """Entry point."""
-    config = chz.entrypoint(GEPAConfig)
-    results = asyncio.run(run_gepa(config))
-
-    winner = print_results(results)
-
-    if config.output_path:
-        save_results(results, config.output_path)
-
-    print(f"\nRecommendation: Use template '{winner}' for RL training")
+    config = chz.entrypoint(RunGEPAConfig)
+    best = asyncio.run(run_gepa(config))
+    print_results(best)
 
 
 if __name__ == "__main__":
