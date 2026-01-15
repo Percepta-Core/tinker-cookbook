@@ -74,7 +74,7 @@ python -m scripts.run_alternation \
     rl_batches_per_round=10 \
     skip_first_gepa=true \
     reflection_provider=anthropic \
-    reflection_model=claude-sonnet-4-20250514 \
+    reflection_model=claude-opus-4-5-20251101 \
     wandb_project=gepa-rl
 ```
 
@@ -134,7 +134,7 @@ src/gepa/
 | `rl_batches_per_round` | 10 | RL batches per round |
 | `skip_first_gepa` | `false` | Skip GEPA in first round |
 | `reflection_provider` | `anthropic` | LLM provider for reflection |
-| `reflection_model` | `claude-sonnet-4-20250514` | Model for trace analysis |
+| `reflection_model` | `claude-opus-4-5-20251101` | Model for trace analysis |
 | `gepa_iterations` | 3 | GEPA optimization iterations per phase |
 | `traces_per_iteration` | 16 | Problems sampled per GEPA iteration |
 
