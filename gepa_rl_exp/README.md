@@ -1,34 +1,43 @@
-# Math RL Training Wrapper
+# GEPA + RL Experiments
 
-A wrapper around `tinker-cookbook` for running math RL training with customizable prompt templates.
+A wrapper around `tinker-cookbook` for running GEPA (Guided Evolution for Prompt Adaptation) combined with RL training on math datasets.
+
+## Overview
+
+This project implements **block coordinate ascent** on prompts and weights:
+- **GEPA Phase**: Optimize the system prompt using trace-based LLM reflection
+- **RL Phase**: Train model weights with the optimized prompt held fixed
+
+The GEPA implementation follows [arxiv:2507.19457](https://arxiv.org/abs/2507.19457), using an external LLM (Claude/GPT-4) to analyze execution traces and propose prompt improvements.
 
 ## Features
 
-- **Prompt Templates**: Three built-in templates (baseline, step-by-step, concise) for different reasoning styles
-- **Organized Outputs**: All runs saved to `runs/` with auto-generated names
-- **Shell Scripts**: Ready-to-use scripts for smoke tests, training, and evaluation
-- **GSM8K & MATH Support**: Works with both grade-school and competition math datasets
+- **True GEPA**: Trace-based reflective prompt optimization (not just template selection)
+- **GEPA+RL Alternation**: Block coordinate ascent between prompt optimization and weight training
+- **Multiple Datasets**: GSM8K, MATH, and arithmetic (toy environment for testing)
+- **W&B Integration**: Track experiments with Weights & Biases
 
 ## Installation
 
 ### Prerequisites
 
-1. **Tinker API Access**: Sign up at [thinkingmachines.ai/tinker](https://thinkingmachines.ai/tinker) and get your API key
+1. **Tinker API Access**: Get your API key from [thinkingmachines.ai/tinker](https://thinkingmachines.ai/tinker)
 
-2. **Set environment variable**:
+2. **Set environment variables**:
    ```bash
    export TINKER_API_KEY=sk-...
+   export ANTHROPIC_API_KEY=sk-ant-...  # For GEPA reflection (or OPENAI_API_KEY)
    ```
 
 ### Setup
 
 ```bash
-# 1. Install tinker-cookbook (from parent directory)
+# Install tinker-cookbook (from parent directory)
 cd ../tinker-cookbook
 pip install -e .[dev]
 
-# 2. Install this wrapper
-cd ../math-rl-wrapper
+# Install this wrapper
+cd ../gepa_rl_exp
 pip install -e .
 ```
 
@@ -36,147 +45,155 @@ pip install -e .
 
 ### Smoke Test (~2-5 minutes)
 
-Quick validation that everything works:
+Quick validation on arithmetic environment:
 
 ```bash
 ./scripts/smoke_test.sh
 ```
 
-With a specific template:
+### RL-Only Training
 
-```bash
-./scripts/smoke_test.sh step_by_step
-```
-
-### Full Training
-
-Train on GSM8K with baseline template:
-
-```bash
-./scripts/train_math_rl.sh gsm8k baseline
-```
-
-Train on MATH with step-by-step reasoning:
-
-```bash
-./scripts/train_math_rl.sh math step_by_step meta-llama/Llama-3.1-8B-Instruct
-```
-
-### Direct Python Invocation
-
-For full control over all parameters:
+Train on GSM8K with pure RL (no GEPA):
 
 ```bash
 python -m src.train \
     env=gsm8k \
-    prompt_template=step_by_step \
-    model_name=meta-llama/Llama-3.1-8B-Instruct \
-    groups_per_batch=100 \
-    group_size=4 \
-    learning_rate=1e-5 \
-    max_tokens=256 \
-    wandb_project=math-rl-experiments
+    n_batches=20 \
+    learning_rate=5e-4 \
+    wandb_project=gepa-rl
 ```
 
-### Evaluation
+### GEPA + RL Training
 
-Evaluate a trained checkpoint:
+Run alternating GEPA and RL phases:
 
 ```bash
-./scripts/eval_math_rl.sh tinker://path/to/checkpoint
+python -m scripts.run_alternation \
+    env=gsm8k \
+    n_rounds=2 \
+    rl_batches_per_round=10 \
+    skip_first_gepa=true \
+    reflection_provider=anthropic \
+    reflection_model=claude-sonnet-4-20250514 \
+    wandb_project=gepa-rl
 ```
 
-## Prompt Templates
+Key options:
+- `skip_first_gepa=true`: Start with RL training (recommended - no traces to analyze initially)
+- `n_rounds`: Number of GEPA→RL cycles
+- `rl_batches_per_round`: RL training batches between GEPA phases
 
-Three templates are available, each demonstrating a different reasoning style:
+## Architecture
 
-| Template | Description | Best For |
-|----------|-------------|----------|
-| `baseline` | Simple enumeration (default) | General math problems |
-| `step_by_step` | Verbose, labeled steps | Complex multi-step problems |
-| `concise` | Minimal reasoning | Simple calculations, speed |
+### GEPA Module (`src/gepa/`)
 
-Use `prompt_template=none` to disable few-shot examples entirely.
+```
+src/gepa/
+├── trace.py       # ExecutionTrace dataclass for rollout records
+├── reflection.py  # LLM-based trace analysis and prompt proposals
+├── optimizer.py   # GEPAOptimizer manages optimization loop
+└── config.py      # GEPAConfig settings
+```
 
-## Configuration Options
+**How GEPA works:**
+1. Collect execution traces (input, output, reward) from model rollouts
+2. Send traces to reflection LLM (Claude/GPT-4) for analysis
+3. Reflection LLM diagnoses failure patterns and proposes prompt improvements
+4. Evaluate proposed prompt on a probe batch
+5. Accept if improvement, otherwise keep current prompt
+
+### Scripts
+
+| Script | Description |
+|--------|-------------|
+| `src/train.py` | Pure RL training |
+| `scripts/run_alternation.py` | GEPA+RL block coordinate ascent |
+| `scripts/run_gepa.py` | GEPA-only optimization (for testing) |
+
+## Configuration
+
+### RL Training (`src/train.py`)
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `env` | `gsm8k` | Dataset: `gsm8k` or `math` |
-| `prompt_template` | `baseline` | Template: `baseline`, `step_by_step`, `concise`, `none` |
-| `model_name` | `meta-llama/Llama-3.1-8B-Instruct` | Base model to fine-tune |
-| `groups_per_batch` | 100 | Number of problems per batch |
-| `group_size` | 4 | Rollouts per problem (for GRPO) |
-| `learning_rate` | 1e-5 | Learning rate |
-| `max_tokens` | 256 | Max generation length |
+| `env` | `gsm8k` | Dataset: `arithmetic`, `gsm8k`, or `math` |
+| `model_name` | `Qwen/Qwen3-8B` | Base model to fine-tune |
+| `n_batches` | `None` | Limit batches (None = full dataset) |
+| `groups_per_batch` | 50 | Problems per batch |
+| `group_size` | 4 | Rollouts per problem |
+| `learning_rate` | `5e-4` | Learning rate (LoRA default) |
 | `lora_rank` | 32 | LoRA rank |
-| `eval_every` | 20 | Evaluation frequency (batches) |
-| `save_every` | 20 | Checkpoint frequency (batches) |
-| `wandb_project` | None | W&B project name |
-| `log_path` | `runs/<auto>` | Output directory |
+| `max_tokens` | 256 | Max generation length |
+| `wandb_project` | `None` | W&B project name |
+
+### GEPA+RL (`scripts/run_alternation.py`)
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `n_rounds` | 3 | Number of GEPA→RL cycles |
+| `rl_batches_per_round` | 10 | RL batches per round |
+| `skip_first_gepa` | `false` | Skip GEPA in first round |
+| `reflection_provider` | `anthropic` | LLM provider for reflection |
+| `reflection_model` | `claude-sonnet-4-20250514` | Model for trace analysis |
+| `gepa_iterations` | 3 | GEPA optimization iterations per phase |
+| `traces_per_iteration` | 16 | Problems sampled per GEPA iteration |
+
+## Experiment Results
+
+GSM8K experiments with Qwen3-8B, 20 batches, LR=5e-4:
+
+| Experiment | Initial | Final Test Accuracy |
+|------------|---------|---------------------|
+| RL-only | 43.5% | 83.5% |
+| GEPA-midway (GEPA at step 10) | 43.8% | 83.8% |
+| GEPA-twice (GEPA at steps 7, 14) | 44.0% | 87.3% |
+
+**Key findings:**
+- RL training works well with correct LoRA LR (5e-4, not 1e-5)
+- Most improvement happens in first 3-5 batches
+- GEPA shows marginal benefit over pure RL in these experiments
 
 ## Output Files
-
-Each training run creates:
 
 ```
 runs/<run_name>/
 ├── config.json          # Full configuration
-├── metrics.jsonl        # Training metrics (one JSON per line)
+├── metrics.jsonl        # Training metrics
 ├── checkpoints.jsonl    # Checkpoint metadata
-└── *.html               # Trajectory visualizations (if enabled)
+├── round0_rl/           # Per-round RL metrics (alternation mode)
+├── round1_rl/
+└── *.html               # Trajectory visualizations
 ```
 
 ### Viewing Metrics
 
 ```bash
-# Latest metrics
-cat runs/<run_name>/metrics.jsonl | tail -5 | jq .
-
-# Reward over time
-cat runs/<run_name>/metrics.jsonl | jq -r '.["env/all/reward/total"] // empty'
+# Key metrics per batch
+cat runs/<run_name>/metrics.jsonl | python -c "
+import sys, json
+for line in sys.stdin:
+    d = json.loads(line)
+    print(f\"batch {d['progress/batch']:2d}: correct={d['env/all/correct']:.0%} reward={d['env/all/reward/total']:.2f}\")
+"
 ```
-
-### Checkpoints
-
-Checkpoints are saved to Tinker's cloud storage. Find paths in:
-
-```bash
-cat runs/<run_name>/checkpoints.jsonl | jq .
-```
-
-## Future Extensions
-
-This wrapper is designed to support:
-
-1. **GEPA-style Prompt Search**: Outer loop over `prompt_template` values
-2. **Expert Iteration**: Use successful traces for SFT distillation
-3. **Custom Templates**: Add new templates in `src/prompt_templates.py`
 
 ## Troubleshooting
 
-### API Authentication
+### Learning Rate
 
-```
-Error: Authentication failed
-```
+For LoRA training, use `learning_rate=5e-4` (not 1e-5). The recommended LoRA LR is ~50x higher than full fine-tuning.
 
-Ensure `TINKER_API_KEY` is set:
+### GEPA Reflection Errors
+
+Ensure your API key is set for the reflection provider:
 ```bash
-echo $TINKER_API_KEY  # Should show sk-...
+export ANTHROPIC_API_KEY=sk-ant-...  # For Anthropic
+export OPENAI_API_KEY=sk-...         # For OpenAI
 ```
 
-### Dataset Download
+### Format Regression
 
-First run downloads datasets from HuggingFace. Ensure you have internet access and sufficient disk space.
-
-### Log Directory Exists
-
-If a previous run used the same log path:
-```bash
-# Delete and retry
-python -m src.train ... behavior_if_log_dir_exists=delete
-
-# Or resume from checkpoint
-python -m src.train ... behavior_if_log_dir_exists=resume
-```
+If GEPA causes format degradation (model outputs correct answers but wrong format), consider:
+- Adding format compliance to the reflection prompt
+- Using `skip_first_gepa=true` to establish good formatting first
+- Reducing `gepa_iterations` to limit prompt changes
